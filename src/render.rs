@@ -11,19 +11,22 @@ use crate::logic::{
     MAZE_H, MAZE_W, TICK_RATE_HZ,
 };
 use macroquad::prelude::*;
+use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Colors (original arcade palette)
 // ---------------------------------------------------------------------------
 const WALL_BLUE: Color = Color::from_rgba(0x21, 0x21, 0xff, 0xff);
 const DOOR_PINK: Color = Color::from_rgba(0xff, 0xb8, 0xff, 0xff);
-const DOT_PEACH: Color = Color::from_rgba(0xff, 0xb8, 0xae, 0xff);
+const DOT_PEACH: Color = Color::from_rgba(0xfe, 0xbd, 0xb4, 0xff);
 const PAC_YELLOW: Color = Color::from_rgba(0xff, 0xff, 0x00, 0xff);
 const FRUIT_RED: Color = Color::from_rgba(0xff, 0x00, 0x00, 0xff);
 const SCORE_CYAN: Color = Color::from_rgba(0x00, 0xff, 0xde, 0xff);
 const EYE_WHITE: Color = Color::from_rgba(0xff, 0xff, 0xff, 0xff);
 const PUPIL_BLUE: Color = Color::from_rgba(0x21, 0x21, 0xff, 0xff);
 const FRIGHT_BODY: Color = Color::from_rgba(0x21, 0x21, 0xff, 0xff);
+const STEM_GREEN: Color = Color::from_rgba(0x3f, 0xb7, 0x3f, 0xff);
+const STEM_BROWN: Color = Color::from_rgba(0x8b, 0x45, 0x13, 0xff);
 
 fn ghost_color(id: GhostId) -> Color {
     match id {
@@ -58,6 +61,10 @@ pub fn run(game: Game) {
 // ---------------------------------------------------------------------------
 
 async fn game_loop(mut game: Game) {
+    // Screenshot hook for automated testing: if PACMAN_SCREENSHOT is set to a
+    // path, capture the scaled-up window image mid-gameplay and exit once.
+    let screenshot_path = std::env::var("PACMAN_SCREENSHOT").ok();
+
     // Offscreen target at exact game resolution (224x288, 8 px per tile).
     let rt = render_target((MAZE_W * 8) as u32, (MAZE_H * 8) as u32);
     rt.texture.set_filter(FilterMode::Nearest);
@@ -69,7 +76,8 @@ async fn game_loop(mut game: Game) {
     ));
     cam.render_target = Some(rt.clone());
 
-    // The maze layout is constant for the whole run: precompute wall segments.
+    // The maze layout is constant for the whole run: precompute the wall
+    // outlines (continuous rounded boundary loops).
     let maze = build_maze_shape(&game.grid);
     let mut audio = audio::Audio::new().await;
     let mut acc = 0.0f32;
@@ -114,6 +122,14 @@ async fn game_loop(mut game: Game) {
             },
         );
 
+        // --- optional one-shot screenshot (mid-gameplay) -------------------
+        if let Some(path) = &screenshot_path {
+            if game.phase == GamePhase::Playing && game.frames >= 240 {
+                let _ = get_screen_data().export_png(path);
+                std::process::exit(0);
+            }
+        }
+
         next_frame().await;
     }
 }
@@ -123,58 +139,155 @@ async fn game_loop(mut game: Game) {
 // ---------------------------------------------------------------------------
 
 struct MazeShape {
-    wall_segs: Vec<Rect>,
+    /// Straight outline runs (already offset into the wall by WALL_OFF).
+    lines: Vec<[Vec2; 2]>,
+    /// Rounded corners: (center, radius, start angle, sweep angle).
+    arcs: Vec<(Vec2, f32, f32, f32)>,
     door_segs: Vec<Rect>,
 }
 
-/// For every wall tile, emit 2px-thick line segments on each side facing a
-/// non-wall tile (out-of-bounds counts as open, so the outer double border is
-/// drawn). Consecutive wall tiles merge their segments, and segments overlap
-/// at corners, producing the classic continuous double-line outlines: a
-/// one-tile-thick wall renders as two parallel blue lines with black between.
+/// Offset of the outline centerline from the wall-region boundary, in pixels.
+const WALL_OFF: f32 = 2.0;
+/// Outline stroke thickness.
+const WALL_LINE_W: f32 = 2.0;
+
+/// Traces the boundaries of all wall regions and converts them into
+/// continuous rounded outlines (the classic double-line arcade look: every
+/// wall region gets an outlined border on each side facing open space, with
+/// filleted corners; thin walls end up outlined on both faces).
+///
+/// Method: collect the directed boundary edges between wall and non-wall
+/// tiles (oriented so the wall region is always on the left of travel),
+/// chain them into closed loops, then render each loop as an offset polyline
+/// with circular-arc fillets at every 90-degree turn. Diagonally adjacent
+/// wall tiles share a pinch vertex and their outlines connect smoothly.
 fn build_maze_shape(grid: &[Tile; MAZE_W * MAZE_H]) -> MazeShape {
-    let open = |tx: i32, ty: i32| -> bool {
-        if tx < 0 || tx >= MAZE_W as i32 || ty < 0 || ty >= MAZE_H as i32 {
-            return true; // outside counts as open -> border lines get drawn
-        }
-        grid[ty as usize * MAZE_W + tx as usize] == Tile::Wall
+    let is_wall = |tx: i32, ty: i32| -> bool {
+        tx >= 0
+            && tx < MAZE_W as i32
+            && ty >= 0
+            && ty < MAZE_H as i32
+            && grid[ty as usize * MAZE_W + tx as usize] == Tile::Wall
     };
-    let mut wall_segs = Vec::new();
-    let mut door_segs = Vec::new();
+
+    // Directed boundary edges: (start vertex, unit direction). Vertex (i, j)
+    // is the tile corner at pixel (i*8, j*8). Each edge is oriented so the
+    // wall tile lies on the left of the travel direction.
+    let mut edges: HashSet<((i32, i32), (i32, i32))> = HashSet::new();
     for ty in 0..MAZE_H {
         for tx in 0..MAZE_W {
-            let tile = grid[ty * MAZE_W + tx];
-            let x = (tx * 8) as f32;
-            let y = (ty * 8) as f32;
-            match tile {
-                Tile::Wall => {
-                    let (up, down, left, right) = (
-                        open(tx as i32, ty as i32 - 1),
-                        open(tx as i32, ty as i32 + 1),
-                        open(tx as i32 - 1, ty as i32),
-                        open(tx as i32 + 1, ty as i32),
-                    );
-                    if up {
-                        wall_segs.push(Rect::new(x, y + 1.0, 8.0, 2.0));
-                    }
-                    if down {
-                        wall_segs.push(Rect::new(x, y + 5.0, 8.0, 2.0));
-                    }
-                    if left {
-                        wall_segs.push(Rect::new(x + 1.0, y, 2.0, 8.0));
-                    }
-                    if right {
-                        wall_segs.push(Rect::new(x + 5.0, y, 2.0, 8.0));
-                    }
-                }
-                Tile::Door => {
-                    door_segs.push(Rect::new(x, y + 3.0, 8.0, 2.0));
-                }
-                _ => {}
+            if grid[ty * MAZE_W + tx] != Tile::Wall {
+                continue;
+            }
+            let (tx, ty) = (tx as i32, ty as i32);
+            if !is_wall(tx, ty - 1) {
+                edges.insert(((tx + 1, ty), (-1, 0))); // top face
+            }
+            if !is_wall(tx, ty + 1) {
+                edges.insert(((tx, ty + 1), (1, 0))); // bottom face
+            }
+            if !is_wall(tx - 1, ty) {
+                edges.insert(((tx, ty), (0, 1))); // left face
+            }
+            if !is_wall(tx + 1, ty) {
+                edges.insert(((tx + 1, ty + 1), (0, -1))); // right face
             }
         }
     }
-    MazeShape { wall_segs, door_segs }
+
+    // Chain edges into closed loops. At vertices where four edges meet
+    // (diagonal wall pinch points) pick the sharpest turn so each diagonal
+    // pair stays part of the same visual outline.
+    let dirs = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)];
+    let mut visited: HashSet<((i32, i32), (i32, i32))> = HashSet::new();
+    let mut loops: Vec<Vec<((i32, i32), (i32, i32))>> = Vec::new();
+    for &start in &edges {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut lp = Vec::new();
+        let mut cur = start;
+        loop {
+            visited.insert(cur);
+            lp.push(cur);
+            let ((vx, vy), (dx, dy)) = cur;
+            // Choose the outgoing edge at the head vertex with the sharpest
+            // turn (minimum cross product); if it is already visited the
+            // loop is closed.
+            let mut best: Option<((i32, i32), (i32, i32))> = None;
+            let mut best_cross = i32::MAX;
+            for &nd in &dirs {
+                let cand = ((vx + dx, vy + dy), nd);
+                if edges.contains(&cand) {
+                    let cross = dx * nd.1 - dy * nd.0;
+                    if cross < best_cross {
+                        best_cross = cross;
+                        best = Some(cand);
+                    }
+                }
+            }
+            match best {
+                Some(next) if !visited.contains(&next) => cur = next,
+                _ => break,
+            }
+        }
+        loops.push(lp);
+    }
+
+    // Render each loop: offset straight runs + circular fillets at corners.
+    let px = |v: (i32, i32)| vec2(v.0 as f32 * 8.0, v.1 as f32 * 8.0);
+    let wall_normal = |d: (i32, i32)| vec2(d.1 as f32, -(d.0 as f32)); // left of travel
+    let mut lines = Vec::new();
+    let mut arcs = Vec::new();
+    for lp in &loops {
+        let n = lp.len();
+        for (i, &((vx, vy), d)) in lp.iter().enumerate() {
+            let nrm = wall_normal(d);
+            let head = (vx + d.0, vy + d.1);
+            // Straight run along this edge, offset toward the wall side.
+            lines.push([px((vx, vy)) + nrm * WALL_OFF, px(head) + nrm * WALL_OFF]);
+            // Fillet at the head corner if the path turns.
+            let (_, nd) = lp[(i + 1) % n];
+            if nd != d {
+                let n_in = nrm;
+                let n_out = wall_normal(nd);
+                let c = px(head);
+                let center = c + (n_in + n_out) * WALL_OFF;
+                let a0 = f32::atan2(
+                    (c + n_in * WALL_OFF - center).y,
+                    (c + n_in * WALL_OFF - center).x,
+                );
+                let a1 = f32::atan2(
+                    (c + n_out * WALL_OFF - center).y,
+                    (c + n_out * WALL_OFF - center).x,
+                );
+                let mut sweep = a1 - a0;
+                while sweep > std::f32::consts::PI {
+                    sweep -= std::f32::consts::TAU;
+                }
+                while sweep < -std::f32::consts::PI {
+                    sweep += std::f32::consts::TAU;
+                }
+                arcs.push((center, WALL_OFF, a0, sweep));
+            }
+        }
+    }
+
+    // Ghost-house door: pink bar across the tile.
+    let mut door_segs = Vec::new();
+    for ty in 0..MAZE_H {
+        for tx in 0..MAZE_W {
+            if grid[ty * MAZE_W + tx] == Tile::Door {
+                door_segs.push(Rect::new(tx as f32 * 8.0, ty as f32 * 8.0 + 3.0, 8.0, 2.0));
+            }
+        }
+    }
+
+    MazeShape {
+        lines,
+        arcs,
+        door_segs,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,9 +298,25 @@ fn draw_world(game: &Game, maze: &MazeShape) {
     let flash = game.phase == GamePhase::LevelComplete && (game.frames / 8) % 2 == 0;
     let wall_col = if flash { EYE_WHITE } else { WALL_BLUE };
 
-    // Maze
-    for r in &maze.wall_segs {
-        draw_rectangle(r.x, r.y, r.w, r.h, wall_col);
+    // Maze: continuous rounded outlines
+    for l in &maze.lines {
+        draw_line(l[0].x, l[0].y, l[1].x, l[1].y, WALL_LINE_W, wall_col);
+    }
+    for &(center, r, a0, sweep) in &maze.arcs {
+        const STEPS: usize = 6;
+        let mut prev = a0;
+        for i in 1..=STEPS {
+            let a = a0 + sweep * (i as f32 / STEPS as f32);
+            draw_line(
+                center.x + r * prev.cos(),
+                center.y + r * prev.sin(),
+                center.x + r * a.cos(),
+                center.y + r * a.sin(),
+                WALL_LINE_W,
+                wall_col,
+            );
+            prev = a;
+        }
     }
     for r in &maze.door_segs {
         draw_rectangle(r.x, r.y, r.w, r.h, DOOR_PINK);
@@ -220,8 +349,8 @@ fn draw_world(game: &Game, maze: &MazeShape) {
     if let Some((px, py, pts)) = game.score_popup {
         let pts = pts as u32; // contract: u32; cast keeps inference unambiguous
         let text = pts.to_string();
-        let dims = measure_text(&text, None, 8, 1.0);
-        draw_text(&text, px - dims.width / 2.0, py + 3.0, 8.0, SCORE_CYAN);
+        let w = px_text_width(&text, 1.0);
+        draw_px_text(&text, px - w / 2.0, py + 3.0, 1.0, SCORE_CYAN);
     }
 
     // Pac-Man (hidden ghosts during the death animation, as in the arcade)
@@ -237,6 +366,128 @@ fn draw_world(game: &Game, maze: &MazeShape) {
 
     // HUD
     draw_hud(game);
+}
+
+// ---------------------------------------------------------------------------
+// Pixel font (procedural 8x8 arcade-style bitmap font, '#' = lit pixel)
+// ---------------------------------------------------------------------------
+
+const GLYPH_0: [&str; 7] = [".####.", "#....#", "#....#", "#....#", "#....#", "#....#", ".####."];
+const GLYPH_1: [&str; 7] = ["...#..", "..##..", "...#..", "...#..", "...#..", "...#..", ".###.."];
+const GLYPH_2: [&str; 7] = [".####.", "#....#", ".....#", "...##.", "..#...", ".#....", "######"];
+const GLYPH_3: [&str; 7] = [".####.", "#....#", ".....#", "..###.", ".....#", "#....#", ".####."];
+const GLYPH_4: [&str; 7] = ["...##.", "..#.#.", ".#..#.", "#...#.", "######", "....#.", "....#."];
+const GLYPH_5: [&str; 7] = ["######", "#.....", "#####.", ".....#", ".....#", "#....#", ".####."];
+const GLYPH_6: [&str; 7] = ["..###.", ".#....", "#.....", "####..", "#....#", "#....#", ".####."];
+const GLYPH_7: [&str; 7] = ["######", ".....#", "....#.", "...#..", "..#...", "..#...", "..#..."];
+const GLYPH_8: [&str; 7] = [".####.", "#....#", "#....#", ".####.", "#....#", "#....#", ".####."];
+const GLYPH_9: [&str; 7] = [".####.", "#....#", "#....#", ".#####", ".....#", "....#.", ".###.."];
+const GLYPH_A: [&str; 7] = ["..##..", ".#..#.", "#....#", "#....#", "######", "#....#", "#....#"];
+const GLYPH_B: [&str; 7] = ["#####.", "#....#", "#....#", "#####.", "#....#", "#....#", "#####."];
+const GLYPH_C: [&str; 7] = [".####.", "#....#", "#.....", "#.....", "#.....", "#....#", ".####."];
+const GLYPH_D: [&str; 7] = ["#####.", "#....#", "#....#", "#....#", "#....#", "#....#", "#####."];
+const GLYPH_E: [&str; 7] = ["######", "#.....", "#.....", "#####.", "#.....", "#.....", "######"];
+const GLYPH_F: [&str; 7] = ["######", "#.....", "#.....", "#####.", "#.....", "#.....", "#....."];
+const GLYPH_G: [&str; 7] = [".####.", "#....#", "#.....", "#..###", "#....#", "#....#", ".####."];
+const GLYPH_H: [&str; 7] = ["#....#", "#....#", "#....#", "######", "#....#", "#....#", "#....#"];
+const GLYPH_I: [&str; 7] = [".####.", "..##..", "..##..", "..##..", "..##..", "..##..", ".####."];
+const GLYPH_J: [&str; 7] = ["..####", "...#..", "...#..", "...#..", "...#..", "..#...", ".##..."];
+const GLYPH_K: [&str; 7] = ["#....#", "#...#.", "#..#..", "#.#...", "##....", "#..#..", "#...#."];
+const GLYPH_L: [&str; 7] = ["#.....", "#.....", "#.....", "#.....", "#.....", "#.....", "######"];
+const GLYPH_M: [&str; 7] = ["#.....#", "##...##", "#.#.#.#", "#..#..#", "#.....#", "#.....#", "#.....#"];
+const GLYPH_N: [&str; 7] = ["#....#", "##...#", "#.#..#", "#..#.#", "#...##", "#....#", "#....#"];
+const GLYPH_O: [&str; 7] = [".####.", "#....#", "#....#", "#....#", "#....#", "#....#", ".####."];
+const GLYPH_P: [&str; 7] = ["#####.", "#....#", "#....#", "#####.", "#.....", "#.....", "#....."];
+const GLYPH_Q: [&str; 7] = [".####.", "#....#", "#....#", "#....#", "#..#.#", "#...#.", ".##.#."];
+const GLYPH_R: [&str; 7] = ["#####.", "#....#", "#....#", "#####.", "#..#..", "#...#.", "#....#"];
+const GLYPH_S: [&str; 7] = [".#####", "#.....", "#.....", ".####.", ".....#", ".....#", "#####."];
+const GLYPH_T: [&str; 7] = ["######", "..#...", "..#...", "..#...", "..#...", "..#...", "..#..."];
+const GLYPH_U: [&str; 7] = ["#....#", "#....#", "#....#", "#....#", "#....#", "#....#", ".####."];
+const GLYPH_V: [&str; 7] = ["#....#", "#....#", "#....#", "#....#", ".#..#.", ".#..#.", "..##.."];
+const GLYPH_W: [&str; 7] = ["#.....#", "#.....#", "#.....#", "#.#.#.#", "#.#.#.#", "#.#.#.#", ".#.#.#."];
+const GLYPH_X: [&str; 7] = ["#....#", "#....#", ".#..#.", "..##..", "..##..", ".#..#.", "#....#"];
+const GLYPH_Y: [&str; 7] = ["#....#", "#....#", ".#..#.", "..##..", "..#...", "..#...", "..#..."];
+const GLYPH_Z: [&str; 7] = ["######", "....#.", "...#..", "..#...", ".#....", "#.....", "######"];
+const GLYPH_BANG: [&str; 7] = ["..#...", "..#...", "..#...", "..#...", "..#...", "......", "..#..."];
+const GLYPH_SPACE: [&str; 7] = ["", "", "", "", "", "", ""];
+
+fn glyph(ch: char) -> Option<&'static [&'static str; 7]> {
+    match ch {
+        '0' => Some(&GLYPH_0),
+        '1' => Some(&GLYPH_1),
+        '2' => Some(&GLYPH_2),
+        '3' => Some(&GLYPH_3),
+        '4' => Some(&GLYPH_4),
+        '5' => Some(&GLYPH_5),
+        '6' => Some(&GLYPH_6),
+        '7' => Some(&GLYPH_7),
+        '8' => Some(&GLYPH_8),
+        '9' => Some(&GLYPH_9),
+        'A' => Some(&GLYPH_A),
+        'B' => Some(&GLYPH_B),
+        'C' => Some(&GLYPH_C),
+        'D' => Some(&GLYPH_D),
+        'E' => Some(&GLYPH_E),
+        'F' => Some(&GLYPH_F),
+        'G' => Some(&GLYPH_G),
+        'H' => Some(&GLYPH_H),
+        'I' => Some(&GLYPH_I),
+        'J' => Some(&GLYPH_J),
+        'K' => Some(&GLYPH_K),
+        'L' => Some(&GLYPH_L),
+        'M' => Some(&GLYPH_M),
+        'N' => Some(&GLYPH_N),
+        'O' => Some(&GLYPH_O),
+        'P' => Some(&GLYPH_P),
+        'Q' => Some(&GLYPH_Q),
+        'R' => Some(&GLYPH_R),
+        'S' => Some(&GLYPH_S),
+        'T' => Some(&GLYPH_T),
+        'U' => Some(&GLYPH_U),
+        'V' => Some(&GLYPH_V),
+        'W' => Some(&GLYPH_W),
+        'X' => Some(&GLYPH_X),
+        'Y' => Some(&GLYPH_Y),
+        'Z' => Some(&GLYPH_Z),
+        '!' => Some(&GLYPH_BANG),
+        ' ' => Some(&GLYPH_SPACE),
+        _ => None,
+    }
+}
+
+/// Draw a string with the 8x8 pixel font. `x`/`y` follow `draw_text`
+/// conventions: `y` is the text baseline, glyphs are 7 px tall above it and
+/// advance 8 px per character. `size` is the scale (1.0 = one font pixel per
+/// game pixel).
+fn draw_px_text(text: &str, x: f32, y: f32, size: f32, col: Color) {
+    let mut cx = x;
+    for ch in text.chars() {
+        if let Some(g) = glyph(ch) {
+            for (r, row) in g.iter().enumerate() {
+                for (c, p) in row.chars().enumerate() {
+                    if p == '#' {
+                        draw_rectangle(
+                            cx + c as f32 * size,
+                            y - (7 - r) as f32 * size,
+                            size,
+                            size,
+                            col,
+                        );
+                    }
+                }
+            }
+        }
+        cx += 8.0 * size;
+    }
+}
+
+/// Pixel width of a string rendered by [`draw_px_text`].
+fn px_text_width(text: &str, size: f32) -> f32 {
+    let n = text.chars().count();
+    if n == 0 {
+        return 0.0;
+    }
+    (n as f32 * 8.0 - 1.0) * size
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +508,14 @@ fn wedge(x: f32, y: f32, r: f32, angle: f32, half_mouth: f32, col: Color) {
     draw_circle(x, y, r, col);
     if half_mouth > 0.01 {
         let a = angle;
-        let p1 = vec2(x + r * 1.2 * (a + half_mouth).cos(), y + r * 1.2 * (a + half_mouth).sin());
-        let p2 = vec2(x + r * 1.2 * (a - half_mouth).cos(), y + r * 1.2 * (a - half_mouth).sin());
+        let p1 = vec2(
+            x + r * 1.2 * (a + half_mouth).cos(),
+            y + r * 1.2 * (a + half_mouth).sin(),
+        );
+        let p2 = vec2(
+            x + r * 1.2 * (a - half_mouth).cos(),
+            y + r * 1.2 * (a - half_mouth).sin(),
+        );
         draw_triangle(vec2(x, y), p1, p2, BLACK);
     }
 }
@@ -274,13 +531,23 @@ fn draw_pacman(p: &PacmanState) {
     wedge(p.x, p.y, 7.0, dir_angle(p.dir), half, PAC_YELLOW);
 }
 
-/// Death animation: the mouth wedge widens every frame until Pac-Man
-/// disappears entirely.
+/// Death animation: Pac-Man's mouth opens progressively wider until the wedge
+/// consumes the whole body, then a brief "pop" burst of sparks.
+/// `dead_anim_frame` runs 1..=45 over the collapse (see logic/pacman.rs);
+/// the phase exits Dying the same tick frame 45 repeats, so the pop shows on
+/// the final two ticks.
 fn draw_pacman_death(p: &PacmanState) {
-    let half = 0.25 + p.dead_anim_frame as f32 * 0.14;
-    if half >= std::f32::consts::PI {
-        return; // fully "eaten" — nothing left to draw
+    const MAX_FRAME: f32 = 45.0;
+    let t = (p.dead_anim_frame as f32 / MAX_FRAME).min(1.0);
+    if p.dead_anim_frame as f32 >= MAX_FRAME - 0.5 {
+        // Final pop: tiny burst of sparks around where Pac-Man stood.
+        for i in 0..8 {
+            let a = i as f32 * std::f32::consts::FRAC_PI_4;
+            draw_circle(p.x + 9.0 * a.cos(), p.y + 9.0 * a.sin(), 1.2, PAC_YELLOW);
+        }
+        return;
     }
+    let half = 0.25 + t * (std::f32::consts::PI - 0.25);
     wedge(p.x, p.y, 7.0, -std::f32::consts::FRAC_PI_2, half, PAC_YELLOW);
 }
 
@@ -307,16 +574,16 @@ fn draw_ghost(g: &GhostState, frames: u64) {
         ghost_color(g.id)
     };
 
-    // Dome body: half circle + straight sides down to the skirt line.
-    draw_circle(x, y - 1.5, 6.5, body_col);
-    draw_rectangle(x - 6.5, y - 1.5, 13.0, 6.5, body_col);
+    // Dome body: half circle + straight sides down to the skirt line (14 px wide).
+    draw_circle(x, y - 1.5, 7.0, body_col);
+    draw_rectangle(x - 7.0, y - 1.5, 14.0, 6.5, body_col);
 
-    // Wavy skirt: alternating teeth, two animation frames.
+    // Wavy skirt: 4-wave hem, two animation frames.
     let skirt_y = y + 5.0;
-    let tooth_w = 13.0 / 3.0;
+    let tooth_w = 14.0 / 4.0;
     let frame = ((frames / 8) % 2) as usize;
-    for i in 0..3 {
-        let tx0 = x - 6.5 + i as f32 * tooth_w;
+    for i in 0..4 {
+        let tx0 = x - 7.0 + i as f32 * tooth_w;
         if (i + frame) % 2 == 0 {
             draw_triangle(
                 vec2(tx0, skirt_y),
@@ -351,7 +618,8 @@ fn draw_eyes(x: f32, y: f32, dir: Direction) {
     };
     for ex in [x - 2.8, x + 2.8] {
         draw_circle(ex, y - 2.5, 2.4, EYE_WHITE);
-        draw_circle(ex + dx, y - 2.5 + dy, 1.3, PUPIL_BLUE);
+        // 2x2 px pupils, offset by looking direction
+        draw_rectangle(ex + dx - 1.0, y - 2.5 + dy - 1.0, 2.0, 2.0, PUPIL_BLUE);
     }
 }
 
@@ -374,30 +642,32 @@ fn draw_frightened_face(x: f32, y: f32, flashing: bool) {
 // HUD
 // ---------------------------------------------------------------------------
 
-fn centered_text(text: &str, cx: f32, baseline: f32, size: f32, col: Color) {
-    let dims = measure_text(text, None, size as u16, 1.0);
-    draw_text(text, cx - dims.width / 2.0, baseline, size, col);
+fn centered_px_text(text: &str, cx: f32, baseline: f32, size: f32, col: Color) {
+    draw_px_text(text, cx - px_text_width(text, size) / 2.0, baseline, size, col);
 }
 
 fn draw_hud(game: &Game) {
-    // Top labels + scores
-    draw_text("1UP", 26.0, 12.0, 8.0, EYE_WHITE);
-    centered_text("HIGH SCORE", 112.0, 12.0, 8.0, EYE_WHITE);
+    // Top labels + scores. "1UP" blinks (~every 16 frames) during play.
+    let oneup_on = game.phase != GamePhase::Playing || (game.frames / 16) % 2 == 0;
+    if oneup_on {
+        draw_px_text("1UP", 26.0, 12.0, 1.0, EYE_WHITE);
+    }
+    centered_px_text("HIGH SCORE", 112.0, 12.0, 1.0, EYE_WHITE);
     let score = game.score.to_string();
-    let dims = measure_text(&score, None, 8, 1.0);
-    draw_text(&score, 40.0 - dims.width, 22.0, 8.0, EYE_WHITE);
+    draw_px_text(&score, 40.0 - px_text_width(&score, 1.0), 22.0, 1.0, EYE_WHITE);
     let high = game.high_score.to_string();
-    centered_text(&high, 112.0, 22.0, 8.0, EYE_WHITE);
+    centered_px_text(&high, 112.0, 22.0, 1.0, EYE_WHITE);
 
-    // Lives as mini pac icons, bottom-left (facing left, like the arcade)
-    let n = game.lives.min(5) as i32;
+    // Lives as mini pac icons, bottom-left (facing left, like the arcade).
+    // The arcade shows spare lives only: lives - 1 icons.
+    let n = game.lives.saturating_sub(1).min(5) as i32;
     for i in 0..n {
         let cx = 14.0 + i as f32 * 16.0;
         wedge(cx, 281.0, 5.0, std::f32::consts::PI, 0.5, PAC_YELLOW);
     }
 
-    // Recent-level fruit trail, bottom-right
-    let first = game.level.saturating_sub(3).max(1);
+    // Recent-level fruit trail, bottom-right: the last 7 fruits.
+    let first = game.level.saturating_sub(6).max(1);
     for lvl in first..=game.level {
         let i = lvl - first;
         draw_fruit_icon(fruit_for_level(lvl), 210.0 - i as f32 * 16.0, 281.0);
@@ -405,8 +675,8 @@ fn draw_hud(game: &Game) {
 
     // Phase text
     match game.phase {
-        GamePhase::Ready(_) => centered_text("READY!", 112.0, 169.0, 8.0, PAC_YELLOW),
-        GamePhase::GameOver => centered_text("GAME  OVER", 112.0, 169.0, 8.0, FRUIT_RED),
+        GamePhase::Ready(_) => centered_px_text("READY!", 112.0, 169.0, 1.0, PAC_YELLOW),
+        GamePhase::GameOver => centered_px_text("GAME  OVER", 112.0, 169.0, 1.0, FRUIT_RED),
         _ => {}
     }
 }
@@ -425,59 +695,70 @@ fn fruit_for_level(level: u32) -> FruitKind {
 }
 
 // ---------------------------------------------------------------------------
-// Procedural fruit icons (8x8-ish, centered at cx, cy)
+// Pixel-sprite fruit icons (8x8, centered at cx, cy; '#' = lit pixel)
 // ---------------------------------------------------------------------------
 
+const FRUIT_CHERRY: [&str; 8] = [
+    "...M....", "..M.M...", ".M...M..", ".M...M..", "RRR.RRR.", "RRR.RRR.", "RRR.RRR.",
+    ".RR.RR..",
+];
+const FRUIT_STRAWBERRY: [&str; 8] = [
+    "..GGGG..", ".GGGGGG.", ".RRRRRR.", "RRWRRWRR", "RRRRWRRR", ".RWRRWR.", "..RRRR..",
+    "...RR...",
+];
+const FRUIT_ORANGE: [&str; 8] = [
+    "....M...", "...GG...", "..OOOO..", ".OOOOOO.", ".OWOOOO.", ".OOOOOO.", "..OOOO..",
+    "........",
+];
+const FRUIT_APPLE: [&str; 8] = [
+    "...M....", "...M....", ".RRRRR..", "RRRRRRR.", "RWRRRRR.", "RRRRRRR.", ".RRRRR..",
+    "..RRR...",
+];
+const FRUIT_MELON: [&str; 8] = [
+    "....M...", "..LLLL..", ".LDLLDL.", "LLDLLDLL", "LLDLLDLL", ".LDLLDL.", "..LLLL..",
+    "........",
+];
+const FRUIT_GALAXIAN: [&str; 8] = [
+    "RR....RR", "RRRYYRRR", ".RRYYRR.", "..RYYR..", "...YY...", "...YY...", "...YY...",
+    "........",
+];
+const FRUIT_BELL: [&str; 8] = [
+    "...YY...", "...YY...", "..YYYY..", ".YYYYYY.", ".YYYYYY.", "YYYYYYYY", "WWWWWWWW",
+    "...WW...",
+];
+const FRUIT_KEY: [&str; 8] = [
+    "..SSSS..", ".SS..SS.", ".SS..SS.", "..SSSS..", "...SS...", "...SS...", "..SSSS..",
+    "...S..S.",
+];
+
 fn draw_fruit_icon(kind: FruitKind, cx: f32, cy: f32) {
-    match kind {
-        FruitKind::Cherry => {
-            draw_circle(cx - 2.0, cy + 2.0, 2.2, FRUIT_RED);
-            draw_circle(cx + 2.5, cy + 1.0, 2.2, FRUIT_RED);
-            draw_line(cx + 3.0, cy + 0.5, cx + 0.5, cy - 3.5, 1.0, Color::from_rgba(0x3f, 0xb7, 0x3f, 0xff));
-            draw_line(cx - 2.0, cy - 0.5, cx + 0.5, cy - 3.5, 1.0, Color::from_rgba(0x3f, 0xb7, 0x3f, 0xff));
-        }
-        FruitKind::Strawberry => {
-            draw_circle(cx, cy + 0.5, 3.2, FRUIT_RED);
-            draw_rectangle(cx - 2.0, cy - 3.5, 4.0, 2.0, Color::from_rgba(0x3f, 0xb7, 0x3f, 0xff));
-            draw_rectangle(cx - 1.0, cy, 1.0, 1.0, EYE_WHITE);
-            draw_rectangle(cx + 0.5, cy - 1.0, 1.0, 1.0, EYE_WHITE);
-            draw_rectangle(cx - 2.0, cy + 1.5, 1.0, 1.0, EYE_WHITE);
-        }
-        FruitKind::Orange => {
-            draw_circle(cx, cy + 0.5, 3.4, Color::from_rgba(0xff, 0xa5, 0x00, 0xff));
-            draw_rectangle(cx - 0.5, cy - 4.0, 1.5, 2.0, Color::from_rgba(0x3f, 0xb7, 0x3f, 0xff));
-        }
-        FruitKind::Apple => {
-            draw_circle(cx, cy + 0.5, 3.4, FRUIT_RED);
-            draw_line(cx, cy - 3.0, cx + 1.0, cy - 4.5, 1.0, Color::from_rgba(0x8b, 0x45, 0x13, 0xff));
-        }
-        FruitKind::Melon => {
-            draw_circle(cx, cy, 3.8, Color::from_rgba(0x7c, 0xfc, 0x00, 0xff));
-            draw_line(cx - 2.0, cy - 2.5, cx - 2.0, cy + 2.5, 1.0, Color::from_rgba(0x2e, 0x8b, 0x2e, 0xff));
-            draw_line(cx + 2.0, cy - 2.5, cx + 2.0, cy + 2.5, 1.0, Color::from_rgba(0x2e, 0x8b, 0x2e, 0xff));
-        }
-        FruitKind::Galaxian => {
-            draw_triangle(
-                vec2(cx - 3.5, cy + 3.0),
-                vec2(cx + 3.5, cy + 3.0),
-                vec2(cx, cy - 3.5),
-                Color::from_rgba(0x00, 0xbf, 0xff, 0xff),
-            );
-            draw_rectangle(cx - 3.5, cy, 7.0, 1.5, FRUIT_RED);
-        }
-        FruitKind::Bell => {
-            draw_triangle(
-                vec2(cx - 3.5, cy + 2.5),
-                vec2(cx + 3.5, cy + 2.5),
-                vec2(cx, cy - 3.5),
-                Color::from_rgba(0xff, 0xd7, 0x00, 0xff),
-            );
-            draw_rectangle(cx - 3.5, cy + 2.5, 7.0, 1.2, EYE_WHITE);
-        }
-        FruitKind::Key => {
-            draw_circle(cx - 2.0, cy - 2.0, 2.0, Color::from_rgba(0xc0, 0xc0, 0xc0, 0xff));
-            draw_rectangle(cx - 1.0, cy - 0.5, 1.5, 5.0, Color::from_rgba(0xc0, 0xc0, 0xc0, 0xff));
-            draw_rectangle(cx - 0.5, cy + 3.0, 2.0, 1.0, Color::from_rgba(0xc0, 0xc0, 0xc0, 0xff));
+    let sprite: &[&str; 8] = match kind {
+        FruitKind::Cherry => &FRUIT_CHERRY,
+        FruitKind::Strawberry => &FRUIT_STRAWBERRY,
+        FruitKind::Orange => &FRUIT_ORANGE,
+        FruitKind::Apple => &FRUIT_APPLE,
+        FruitKind::Melon => &FRUIT_MELON,
+        FruitKind::Galaxian => &FRUIT_GALAXIAN,
+        FruitKind::Bell => &FRUIT_BELL,
+        FruitKind::Key => &FRUIT_KEY,
+    };
+    let x0 = cx - 4.0;
+    let y0 = cy - 4.0;
+    for (r, row) in sprite.iter().enumerate() {
+        for (c, p) in row.chars().enumerate() {
+            let col = match p {
+                'R' => FRUIT_RED,
+                'G' => STEM_GREEN,
+                'L' => Color::from_rgba(0x7c, 0xfc, 0x00, 0xff),
+                'D' => Color::from_rgba(0x2e, 0x8b, 0x2e, 0xff),
+                'Y' => Color::from_rgba(0xff, 0xd7, 0x00, 0xff),
+                'W' => EYE_WHITE,
+                'M' => STEM_BROWN,
+                'O' => Color::from_rgba(0xff, 0xa5, 0x00, 0xff),
+                'S' => Color::from_rgba(0xc0, 0xc0, 0xc0, 0xff),
+                _ => continue,
+            };
+            draw_rectangle(x0 + c as f32, y0 + r as f32, 1.0, 1.0, col);
         }
     }
 }
