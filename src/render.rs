@@ -139,17 +139,23 @@ async fn game_loop(mut game: Game) {
 // ---------------------------------------------------------------------------
 
 struct MazeShape {
-    /// Straight outline runs (already offset into the wall by WALL_OFF).
+    /// Straight outline runs (already offset into the wall; two parallel
+    /// lines per boundary — the classic double-line outline).
     lines: Vec<[Vec2; 2]>,
     /// Rounded corners: (center, radius, start angle, sweep angle).
     arcs: Vec<(Vec2, f32, f32, f32)>,
     door_segs: Vec<Rect>,
 }
 
-/// Offset of the outline centerline from the wall-region boundary, in pixels.
-const WALL_OFF: f32 = 2.0;
-/// Outline stroke thickness.
-const WALL_LINE_W: f32 = 2.0;
+/// Outline stroke thickness (each of the two parallel lines is 1 px wide).
+const WALL_LINE_W: f32 = 1.0;
+
+/// The classic double-line outline: for each wall boundary we draw two
+/// parallel 1 px lines. Each entry is `(centerline offset from the
+/// wall-region boundary in px, corner fillet radius in px)` — the outer
+/// line gets the big, clearly visible quarter-circle corners, the inner
+/// line a smaller one, exactly like the arcade maze.
+const WALL_OUTLINES: [(f32, f32); 2] = [(0.5, 3.0), (2.5, 1.5)];
 
 /// Traces the boundaries of all wall regions and converts them into
 /// continuous rounded outlines (the classic double-line arcade look: every
@@ -158,8 +164,10 @@ const WALL_LINE_W: f32 = 2.0;
 ///
 /// Method: collect the directed boundary edges between wall and non-wall
 /// tiles (oriented so the wall region is always on the left of travel),
-/// chain them into closed loops, then render each loop as an offset polyline
-/// with circular-arc fillets at every 90-degree turn. Diagonally adjacent
+/// chain them into closed loops, then render each loop twice (once per
+/// outline line) as an offset polyline with circular-arc fillets at every
+/// 90-degree turn — convex corners get a true quarter-circle fillet, so
+/// every wall corner reads as rounded like the arcade. Diagonally adjacent
 /// wall tiles share a pinch vertex and their outlines connect smoothly.
 fn build_maze_shape(grid: &[Tile; MAZE_W * MAZE_H]) -> MazeShape {
     let is_wall = |tx: i32, ty: i32| -> bool {
@@ -234,41 +242,74 @@ fn build_maze_shape(grid: &[Tile; MAZE_W * MAZE_H]) -> MazeShape {
         loops.push(lp);
     }
 
-    // Render each loop: offset straight runs + circular fillets at corners.
+    // Render each loop: two offset outlines, straight runs trimmed back
+    // where the corner fillets tangent onto them + circular fillet arcs at
+    // every corner, so lines and arcs join with no gaps or overshoot.
     let px = |v: (i32, i32)| vec2(v.0 as f32 * 8.0, v.1 as f32 * 8.0);
     let wall_normal = |d: (i32, i32)| vec2(d.1 as f32, -(d.0 as f32)); // left of travel
+    let cross = |a: (i32, i32), b: (i32, i32)| a.0 * b.1 - a.1 * b.0;
     let mut lines = Vec::new();
     let mut arcs = Vec::new();
     for lp in &loops {
         let n = lp.len();
-        for (i, &((vx, vy), d)) in lp.iter().enumerate() {
-            let nrm = wall_normal(d);
-            let head = (vx + d.0, vy + d.1);
-            // Straight run along this edge, offset toward the wall side.
-            lines.push([px((vx, vy)) + nrm * WALL_OFF, px(head) + nrm * WALL_OFF]);
-            // Fillet at the head corner if the path turns.
-            let (_, nd) = lp[(i + 1) % n];
-            if nd != d {
-                let n_in = nrm;
-                let n_out = wall_normal(nd);
-                let c = px(head);
-                let center = c + (n_in + n_out) * WALL_OFF;
-                let a0 = f32::atan2(
-                    (c + n_in * WALL_OFF - center).y,
-                    (c + n_in * WALL_OFF - center).x,
-                );
-                let a1 = f32::atan2(
-                    (c + n_out * WALL_OFF - center).y,
-                    (c + n_out * WALL_OFF - center).x,
-                );
-                let mut sweep = a1 - a0;
-                while sweep > std::f32::consts::PI {
-                    sweep -= std::f32::consts::TAU;
+        for &(off, rad) in &WALL_OUTLINES {
+            for (i, &((vx, vy), d)) in lp.iter().enumerate() {
+                let nrm = wall_normal(d);
+                let head = (vx + d.0, vy + d.1);
+                let p0 = px((vx, vy)) + nrm * off;
+                let p1 = px(head) + nrm * off;
+                let (_, pd) = lp[(i + n - 1) % n];
+                let (_, nd) = lp[(i + 1) % n];
+                let turn_in = pd != d;
+                let turn_out = nd != d;
+                // Distance back from a corner where the fillet arc tangent
+                // meets this edge (convex corner: off + rad; concave: the
+                // arc simply bridges the two offset points, radius = off).
+                let trim = |convex: bool| if convex { off + rad } else { (off - rad).max(0.0) };
+                let t_in = if turn_in { trim(cross(pd, d) < 0) } else { 0.0 };
+                let t_out = if turn_out { trim(cross(d, nd) < 0) } else { 0.0 };
+                let dir_f = vec2(d.0 as f32, d.1 as f32);
+                // Straight run along this edge, offset toward the wall side,
+                // trimmed to the fillet tangent points on both ends.
+                if t_in + t_out <= 8.0 {
+                    let start = if turn_in { p0 + dir_f * t_in } else { p0 };
+                    let end = if turn_out { p1 - dir_f * t_out } else { p1 };
+                    lines.push([start, end]);
                 }
-                while sweep < -std::f32::consts::PI {
-                    sweep += std::f32::consts::TAU;
+                // Fillet arc at the head corner if the path turns.
+                if turn_out {
+                    let c = px(head);
+                    let n_in = nrm;
+                    let n_out = wall_normal(nd);
+                    let (center, radius, pin, pout) = if cross(d, nd) < 0 {
+                        // Convex corner: quarter-circle fillet of radius `rad`.
+                        (
+                            c + (n_in + n_out) * (off + rad),
+                            rad,
+                            c + n_in * off + n_out * (off + rad),
+                            c + n_out * off + n_in * (off + rad),
+                        )
+                    } else {
+                        // Concave corner: bridge arc joining the two offset
+                        // points around the inside of the turn.
+                        (
+                            c + (n_in + n_out) * off,
+                            off,
+                            c + n_in * off,
+                            c + n_out * off,
+                        )
+                    };
+                    let a0 = f32::atan2((pin - center).y, (pin - center).x);
+                    let a1 = f32::atan2((pout - center).y, (pout - center).x);
+                    let mut sweep = a1 - a0;
+                    while sweep > std::f32::consts::PI {
+                        sweep -= std::f32::consts::TAU;
+                    }
+                    while sweep < -std::f32::consts::PI {
+                        sweep += std::f32::consts::TAU;
+                    }
+                    arcs.push((center, radius, a0, sweep));
                 }
-                arcs.push((center, WALL_OFF, a0, sweep));
             }
         }
     }
@@ -552,18 +593,71 @@ fn draw_pacman_death(p: &PacmanState) {
 }
 
 // ---------------------------------------------------------------------------
-// Ghosts
+// Ghosts (14x14 pixel bitmap sprites with a two-frame wave skirt, like the
+// arcade ROM sprites)
 // ---------------------------------------------------------------------------
 
+/// Ghost body bitmaps, 14x14 ('B' = body colour, '.' = transparent).
+/// The dome sides drop vertically from a flat rounded top, and the skirt
+/// alternates between two wave frames every ~10 ticks, as in the arcade.
+const GHOST_BODY_A: [&str; 14] = [
+    "....BBBBBB....",
+    "..BBBBBBBBBB..",
+    ".BBBBBBBBBBBB.",
+    ".BBBBBBBBBBBB.",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BB.BB.BB.BB.BB",
+    "BB.BB.BB.BB.BB",
+];
+const GHOST_BODY_B: [&str; 14] = [
+    "....BBBBBB....",
+    "..BBBBBBBBBB..",
+    ".BBBBBBBBBBBB.",
+    ".BBBBBBBBBBBB.",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBBBBBBBBBBBBB",
+    "BBB.BBBBBB.BBB",
+    "BB..BBBBBB..BB",
+];
+
+/// White of the eye: 5x5 oval ('#' = lit).
+const EYE_OVAL: [&str; 5] = [".###.", "#####", "#####", "#####", ".###."];
+
+/// Draw a bitmap sprite at 1 game pixel per cell, top-left at (x0, y0).
+fn draw_bitmap(rows: &[&str], x0: f32, y0: f32, lit: char, col: Color) {
+    for (r, row) in rows.iter().enumerate() {
+        for (c, p) in row.chars().enumerate() {
+            if p == lit {
+                draw_rectangle(x0 + c as f32, y0 + r as f32, 1.0, 1.0, col);
+            }
+        }
+    }
+}
+
 fn draw_ghost(g: &GhostState, frames: u64) {
-    let x = g.x;
-    let y = g.y;
     let frightened = g.mode == GhostMode::Frightened;
     let eaten = g.mode == GhostMode::Eaten;
 
+    // 14x14 sprite origin, snapped to whole game pixels so it stays crisp.
+    let sx = g.x.round() - 7.0;
+    let sy = g.y.round() - 7.0;
+
     // Eyes only while returning home after being eaten.
     if eaten {
-        draw_eyes(x, y, g.dir);
+        draw_eyes(sx, sy, g.dir);
         return;
     }
 
@@ -574,67 +668,61 @@ fn draw_ghost(g: &GhostState, frames: u64) {
         ghost_color(g.id)
     };
 
-    // Dome body: half circle + straight sides down to the skirt line (14 px wide).
-    draw_circle(x, y - 1.5, 7.0, body_col);
-    draw_rectangle(x - 7.0, y - 1.5, 14.0, 6.5, body_col);
-
-    // Wavy skirt: 4-wave hem, two animation frames.
-    let skirt_y = y + 5.0;
-    let tooth_w = 14.0 / 4.0;
-    let frame = ((frames / 8) % 2) as usize;
-    for i in 0..4 {
-        let tx0 = x - 7.0 + i as f32 * tooth_w;
-        if (i + frame) % 2 == 0 {
-            draw_triangle(
-                vec2(tx0, skirt_y),
-                vec2(tx0 + tooth_w, skirt_y),
-                vec2(tx0 + tooth_w / 2.0, skirt_y + 2.5),
-                body_col,
-            );
-        } else {
-            // notch: black triangle biting up into the skirt
-            draw_triangle(
-                vec2(tx0, skirt_y),
-                vec2(tx0 + tooth_w, skirt_y),
-                vec2(tx0 + tooth_w / 2.0, skirt_y - 2.5),
-                BLACK,
-            );
-        }
-    }
+    // Dome + wavy skirt from the 14x14 bitmap; two-frame wave animation,
+    // flipping every 10 ticks like the original.
+    let frame = if (frames / 10) % 2 == 0 {
+        &GHOST_BODY_A
+    } else {
+        &GHOST_BODY_B
+    };
+    draw_bitmap(frame, sx, sy, 'B', body_col);
 
     if frightened {
-        draw_frightened_face(x, y, flashing);
+        draw_frightened_face(sx, sy, flashing);
     } else {
-        draw_eyes(x, y, g.dir);
+        draw_eyes(sx, sy, g.dir);
     }
 }
 
-fn draw_eyes(x: f32, y: f32, dir: Direction) {
-    let (dx, dy) = match dir {
-        Direction::Up => (0.0, -1.2),
-        Direction::Down => (0.0, 1.2),
-        Direction::Left => (-1.2, 0.0),
-        Direction::Right => (1.2, 0.0),
+/// The big arcade eyes: two 5x5 white ovals (sprite cols 1-5 / 8-12, rows
+/// 3-7) with 2x2 dark-blue pupils that shift within the eye toward the
+/// looking direction. Coordinates are relative to the 14x14 sprite whose
+/// top-left is at (sx, sy).
+fn draw_eyes(sx: f32, sy: f32, dir: Direction) {
+    // Pupil offset (eye-local px, top-left of the 2x2 pupil) by direction.
+    let (pdx, pdy) = match dir {
+        Direction::Up => (2.0, 0.0),
+        Direction::Down => (2.0, 3.0),
+        Direction::Left => (0.0, 2.0),
+        Direction::Right => (3.0, 2.0),
     };
-    for ex in [x - 2.8, x + 2.8] {
-        draw_circle(ex, y - 2.5, 2.4, EYE_WHITE);
-        // 2x2 px pupils, offset by looking direction
-        draw_rectangle(ex + dx - 1.0, y - 2.5 + dy - 1.0, 2.0, 2.0, PUPIL_BLUE);
+    for ex in [1.0f32, 8.0] {
+        for (r, row) in EYE_OVAL.iter().enumerate() {
+            for (c, p) in row.chars().enumerate() {
+                if p == '#' {
+                    draw_rectangle(sx + ex + c as f32, sy + 3.0 + r as f32, 1.0, 1.0, EYE_WHITE);
+                }
+            }
+        }
+        draw_rectangle(sx + ex + pdx, sy + 3.0 + pdy, 2.0, 2.0, PUPIL_BLUE);
     }
 }
 
-fn draw_frightened_face(x: f32, y: f32, flashing: bool) {
+fn draw_frightened_face(sx: f32, sy: f32, flashing: bool) {
     let face = if flashing { FRUIT_RED } else { EYE_WHITE };
-    // eyes: two small squares
-    draw_rectangle(x - 4.2, y - 3.5, 2.4, 2.4, face);
-    draw_rectangle(x + 1.8, y - 3.5, 2.4, 2.4, face);
-    // wavy mouth: zigzag segments
-    let y0 = y + 2.0;
-    for (i, sx) in [x - 5.0, x - 2.5, x, x + 2.5].iter().enumerate() {
-        let sx = *sx;
-        let up = i % 2 == 0;
-        let dy = if up { -1.5 } else { 1.5 };
-        draw_line(sx, y0 - dy, sx + 2.5, y0 + dy, 1.0, face);
+    // Square-ish eyes: 2x2 px each (sprite cols 3-4 / 9-10, rows 4-5).
+    for ex in [3.0f32, 9.0] {
+        draw_rectangle(sx + ex, sy + 4.0, 2.0, 2.0, face);
+    }
+    // Wavy mouth: 1 px zigzag across sprite rows 9-10.
+    for i in 0..5 {
+        let x0 = sx + 2.0 + i as f32 * 2.0;
+        let (y0, y1) = if i % 2 == 0 {
+            (sy + 10.0, sy + 9.0)
+        } else {
+            (sy + 9.0, sy + 10.0)
+        };
+        draw_line(x0, y0, x0 + 2.0, y1, 1.0, face);
     }
 }
 
